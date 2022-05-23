@@ -127,3 +127,7 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# project specific ignores...
+./word_map.json
+./test.ipynb
