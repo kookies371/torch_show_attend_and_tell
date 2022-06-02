@@ -14,8 +14,8 @@ class CustomCOCOCaption(CocoCaptions):
         annFile: str,
         transform: transforms = None,
         max_cpi: int = 10,
-        max_cap_len: int = 100,
-        num_words: int = 10000,
+        max_cap_len: int = 100, # C
+        num_words: int = 10000, # K
         tokenizer: str = "basic_english",
     ):
         """
@@ -42,18 +42,28 @@ class CustomCOCOCaption(CocoCaptions):
             self.word_map = json.load(f)
 
 
-    def _collate_fn(self, x):
+    def collate_fn(self, x):
         imgs, captionss = [], []
         for img, captions in x:
+            # img: Tensor(3, 640, 640)
+            # captions: ['caption1', 'caption2', ...]
             imgs.append(img)
 
-            tokens = self.tokenizer(captions)
-            tokens = [self.word_map[token] for token in tokens]
-            tokens = [self.word_map["<start>"]] + tokens + [self.word_map["<end>"]]
-            tokens = tokens + [self.word_map["<pad>"]] * (self.max_cap_len - len(tokens))
-            captionss.append(tokens)
-        
-        imgs = torch.stack(imgs, dim=0)
-        captionss = torch.stack(tokens, dim=0)
+            for caption in captions:
+                # caption: 'sentence'
+                # idxs: [int] size C(=max_cap_len)
+                #   [0, 3, 172, 15, ...] corresponding to word_map
+                tokens = self.tokenizer(caption)
 
-        return (imgs, captionss)
+                idxs = [self.word_map.get(token, self.word_map["<unk>"]) for token in tokens]
+                idxs = [self.word_map["<start>"]] + idxs + [self.word_map["<end>"]]
+                idxs = idxs + [self.word_map["<pad>"]] * (self.max_cap_len - len(idxs))
+
+            captionss.append(idxs)
+        
+        # imgs: Tensor(N, 3, 640, 640)
+        # idxss: Tensor(N, C)
+        imgs = torch.stack(imgs, dim=0)
+        captionss = torch.LongTensor(captionss)
+
+        return imgs, captionss

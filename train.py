@@ -1,7 +1,11 @@
+from matplotlib.transforms import Transform
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
+import torchvision.transforms as transforms
+
+from models import TotalModel
 from dataset import CustomCOCOCaption
 
 """TODO
@@ -22,10 +26,10 @@ make_idx
 
 
 def train(
-    model,
+    model: TotalModel,
     dataset: CustomCOCOCaption,
     loss_fn,
-    optimizer,
+    optimizer: torch.optim.Optimizer,
     batch_size: int = 16,
     max_epoch: int = 100,
 ) -> None:
@@ -47,66 +51,90 @@ def train(
     model.to(device)
 
     N = batch_size
+    D = model.D
+    L = model.L # n_pixels after encode
     # max_cpi: maximum number of captions per image
     # max_cap_len: maximum number of words in each caption
     # num_words: number of words appeared in the dataset = size of embedding vector
     max_cpi = dataset.max_cpi
-    max_cap_len = dataset.max_cap_len
-    num_words = dataset.num_words
+    max_cap_len = dataset.max_cap_len # C
+    num_words = dataset.num_words # K
 
     dataloader = DataLoader(
         dataset,
         batch_size=N,
-        collate_fn=dataset._collate_fn(),
+        collate_fn=dataset.collate_fn,
         pin_memory=True,
         drop_last=True,
     )
 
     for epoch in range(max_epoch):
         for i_batch, (imgs, captionss) in enumerate(dataloader):
-            # imgs : Tensor(N, 3, 640, 640)
-            # captionss : Tensor(N, max_cpi, max_cap_len)
+            # imgs: Tensor(N, 3, 640, 640)
+            # captionss: LongTensor(N, C) (index tensor, not one-hot)
+            imgs = imgs.to(device)
+            captionss = captionss.to(device)
+
+            # initialize optimizer
+            optimizer.zero_grad()
 
             # forward img and get feature map
-            # may feature_h = feature_w
-            imgs = imgs.to(device)
-            features = model.Encoder(imgs)  # (N, feature_c, feature_h, feature_w)
+            # feature: Tensor(N, L, D)
+            feature = model.encoder(imgs) # (N, D, encode_w, encode_h)
+            feature = feature.view(N, D, -1) # (N, D, L)
+            feature = feature.permute(0, 2, 1) # (N, L, D)
 
             # Initialize hidden vectors
-            # h, c: Tensor(N, decoder_hidden)
-            prev_h, prev_c = model.init_hidden(features)
-            # y: Tensor(N, )
-            prev_y = dataset.word_map["<start>"]
+            # prev_h, prev_c: Tensor(N, n)
+            prev_h, prev_c = model.init_hiddens(feature)
+
+            # initialize Tensor storing results
+            # predictions: Tensor(N, C, K)
+            # alphas: Tensor(N, L, C)
+            predictions = torch.zeros((N, max_cap_len, num_words), dtype=torch.float).to(device)
+            alphas = torch.zeros((N, L, max_cap_len)).to(device)
 
             # forward feature map in LSTM
             # variable name 't' from paper
             for t in range(max_cap_len):
                 # calculate weighted feature through attention layer
-                # decoder_in = feature_c
-                # n_pixels = feature_h * feature_w
-                alpha = model.Attention(features, h)  # (N, n_pixels)
-                context = model.calculate_context(features, alpha)  # (N, decoder_in)
+                # context: Tensor(N, D) (=weighted_feature, 'z_hat' in paper)
+                # alpha: Tensor(N, L)
+                context, alpha = model.attention(feature, prev_h)
+                
+                # prepare y
+                # prev_y: Tensor(N, K)
+                # prev_y_embed: Tensor(N, m)
+                prev_y = F.one_hot(captionss[:, t], num_classes=num_words)
+                prev_y = prev_y.type(torch.float)
+                prev_y_embed = model.E(prev_y)
 
                 # decode through LSTM cell
-                h, c = model.Decoder(context, (h, c))
+                next_h, next_c = model.decoder(
+                    torch.cat([context, prev_y_embed], dim=1),
+                    (prev_h, prev_c)
+                )
 
                 # calculate output word probability
-                if t == 0:
-                    prev_y = word_map["<start>"]  # TODO : shape?
-                else:
-                    prev_y = idx[..., t - 1]
-                probability = model.embedding(prev_y) + model.Lh(h) + model.Lz(context)
-                probability = model.L_o(probability).softmax(dim=1)  # (N, embed_size)
+                # p: Tensor(N, m)
+                p = model.E(prev_y) + model.Lh(next_h) + model.Lz(context)
+                p = model.Lo(p)
+                p = F.softmax(p, dim=1)
 
                 # stack results
-                predictions[..., t] = probability
+                predictions[:, t, :] = p
+                alphas[:, :, t] = alpha
 
-            # calculate loss
-            loss = loss_fn(predictions)
+                # update hidden vectors
+                prev_h, prev_c = next_h, next_c
 
-            # backpropagate loss
+            # train
+            loss = loss_fn(predictions.permute(0, 2, 1), captionss)
+            loss.backward()
+            optimizer.step()
 
             # make statistics?
+            print(f'epoch: {epoch}, i_batch: {i_batch}, loss: {loss.item()}')
 
 
 if __name__ == "__main__":
@@ -115,15 +143,24 @@ if __name__ == "__main__":
     # max_cpi, max_cap_len, attention type 등 모델 정보
     # model을 저장할 filename도
 
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
     # Initialize model, dataset
-    model = 0
-    dataset = CustomCOCOCaption()
+    model = TotalModel(D=2048, K=10000, C=100, L=196, m=100, n=100).to(device)
+    dataset = CustomCOCOCaption(
+        root='../torch_datasets/val2014',
+        annFile='../torch_datasets/annotations/captions_val2014.json',
+        transform=transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Resize((640, 640))
+        ])
+    )
 
     # optimizer, loss_fn
     max_epoch = 100
-    batch_size = 16
-    loss_fn = 0
-    optimizer = 0
+    batch_size = 4
+    loss_fn = nn.CrossEntropyLoss()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.99)
     train(model, dataset, loss_fn, optimizer, batch_size, max_epoch)
 
     # save model
